@@ -1,0 +1,66 @@
+= gun_tunnel_up(3)
+
+== Name
+
+gun_tunnel_up - The tunnel is up
+
+== Description
+
+[source,erlang]
+----
+{gun_tunnel_up, ConnPid, StreamRef, Protocol}
+
+ConnPid   :: pid()
+StreamRef :: gun:stream_ref() | undefined
+Protocol  :: http | http2 | socks
+----
+
+The tunnel is up.
+
+This message informs the owner/calling process that the connection
+completed through the SOCKS or CONNECT proxy.
+
+If Gun is configured to connect to another SOCKS server, then the
+connection is not usable yet. One or more
+link:man:gun_tunnel_up(3)[gun_tunnel_up(3)] messages will follow.
+
+== Elements
+
+ConnPid::
+
+The pid of the Gun connection process.
+
+StreamRef::
+
+The stream reference the tunnel is running on, or `undefined`
+if there are no underlying stream.
+
+Protocol::
+
+The protocol selected for this connection. It can be used
+to determine the capabilities of the server.
+
+== Changelog
+
+* *2.0*: Message introduced.
+
+== Examples
+
+.Receive a gun_tunnel_up message in a gen_server
+[source,erlang]
+----
+handle_info({gun_tunnel_up, ConnPid, _StreamRef, _Protocol},
+            State=#state{conn_pid=ConnPid}) ->
+    %% Do something.
+    {noreply, State}.
+----
+
+== See also
+
+link:man:gun(3)[gun(3)],
+link:man:gun:open(3)[gun:open(3)],
+link:man:gun:open_unix(3)[gun:open_unix(3)],
+link:man:gun:await_up(3)[gun:await_up(3)],
+link:man:gun_up(3)[gun_up(3)],
+link:man:gun_down(3)[gun_down(3)],
+link:man:gun_error(3)[gun_error(3)]
