@@ -1,0 +1,238 @@
+name: Run test case
+
+concurrency:
+  group: test-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - v*
+      - e*
+  pull_request:
+
+jobs:
+    prepare:
+        runs-on: ubuntu-20.04
+        # prepare source with any OTP version, no need for a matrix
+        container: "ghcr.io/emqx/emqx-builder/5.0-17:1.13.4-24.2.1-1-ubuntu20.04"
+        outputs:
+          fast_ct_apps: ${{ steps.run_find_apps.outputs.fast_ct_apps }}
+          docker_ct_apps: ${{ steps.run_find_apps.outputs.docker_ct_apps }}
+        steps:
+        - uses: actions/checkout@v2
+          with:
+            path: source
+            fetch-depth: 0
+        - name: find_ct_apps
+          working-directory: source
+          id: run_find_apps
+          run: |
+            fast_ct_apps="$(./scripts/find-apps.sh --ct fast --json)"
+            docker_ct_apps="$(./scripts/find-apps.sh --ct docker --json)"
+            echo "fast-ct-apps: $fast_ct_apps"
+            echo "docer-ct-apps: $docker_ct_apps"
+            echo "::set-output name=fast_ct_apps::$fast_ct_apps"
+            echo "::set-output name=docker_ct_apps::$docker_ct_apps"
+        - name: get_all_deps
+          working-directory: source
+          run: |
+            make deps-all
+            ./rebar3 as test compile
+            cd ..
+            zip -ryq source.zip source/* source/.[^.]*
+        - uses: actions/upload-artifact@v2
+          with:
+            name: source
+            path: source.zip
+
+    eunit_and_proper:
+        needs: prepare
+        runs-on: aws-amd64
+        defaults:
+          run:
+            shell: bash
+        container: "ghcr.io/emqx/emqx-builder/5.0-17:1.13.4-24.2.1-1-ubuntu20.04"
+
+        steps:
+        - uses: AutoModality/action-clean@v1
+        - uses: actions/download-artifact@v2
+          with:
+            name: source
+            path: .
+        - name: unzip source code
+          run: unzip -o -q source.zip
+          # produces eunit.coverdata
+        - name: eunit
+          working-directory: source
+          run: make eunit
+
+          # produces proper.coverdata
+        - name: proper
+          working-directory: source
+          run: make proper
+
+        - uses: actions/upload-artifact@v2
+          with:
+            name: coverdata
+            path: source/_build/test/cover
+
+    ct_docker:
+        needs: prepare
+        strategy:
+          fail-fast: false
+          matrix:
+            app_name: ${{ fromJson(needs.prepare.outputs.docker_ct_apps) }}
+            otp_release:
+              - "erlang24"
+
+        runs-on: aws-amd64
+        defaults:
+          run:
+            shell: bash
+
+        steps:
+        - uses: AutoModality/action-clean@v1
+        - uses: actions/download-artifact@v2
+          with:
+            name: source
+            path: .
+        - name: unzip source code
+          run: unzip -q source.zip
+        - name: docker compose up
+          working-directory: source
+          env:
+            MONGO_TAG: 5
+            MYSQL_TAG: 8
+            PGSQL_TAG: 13
+            REDIS_TAG: 6
+          run: |
+            docker-compose \
+                -f .ci/docker-compose-file/docker-compose-mongo-single-tcp.yaml \
+                -f .ci/docker-compose-file/docker-compose-mongo-single-tls.yaml \
+                -f .ci/docker-compose-file/docker-compose-mysql-tcp.yaml \
+                -f .ci/docker-compose-file/docker-compose-mysql-tls.yaml \
+                -f .ci/docker-compose-file/docker-compose-pgsql-tcp.yaml \
+                -f .ci/docker-compose-file/docker-compose-pgsql-tls.yaml \
+                -f .ci/docker-compose-file/docker-compose-redis-single-tcp.yaml \
+                -f .ci/docker-compose-file/docker-compose-redis-single-tls.yaml \
+                -f .ci/docker-compose-file/docker-compose.yaml \
+                up -d --build
+
+          # produces <app-name>.coverdata
+        - name: run common test
+          working-directory: source
+          run: |
+            docker exec -i ${{ matrix.otp_release }} bash -c "git config --global --add safe.directory \"$GITHUB_WORKSPACE\" && make ${{ matrix.app_name }}-ct"
+        - uses: actions/upload-artifact@v1
+          if: matrix.otp_release == 'erlang24'
+          with:
+            name: coverdata
+            path: source/_build/test/cover
+        - uses: actions/upload-artifact@v1
+          if: failure()
+          with:
+            name: logs_${{ matrix.otp_release }}
+            path: source/_build/test/logs
+
+    ct:
+        needs: prepare
+        strategy:
+          fail-fast: false
+          matrix:
+            app_name: ${{ fromJson(needs.prepare.outputs.fast_ct_apps) }}
+        runs-on: aws-amd64
+        container: "ghcr.io/emqx/emqx-builder/5.0-17:1.13.4-24.2.1-1-ubuntu20.04"
+        defaults:
+          run:
+            shell: bash
+
+        steps:
+        - uses: AutoModality/action-clean@v1
+        - uses: actions/download-artifact@v2
+          with:
+            name: source
+            path: .
+        - name: unzip source code
+          run: unzip -q source.zip
+
+          # produces <app-name>.coverdata
+        - name: run common test
+          working-directory: source
+          run: |
+            make ${{ matrix.app_name }}-ct
+        - uses: actions/upload-artifact@v1
+          with:
+            name: coverdata
+            path: source/_build/test/cover
+        - uses: actions/upload-artifact@v1
+          if: failure()
+          with:
+            name: logs_${{ matrix.otp_release }}
+            path: source/_build/test/logs
+
+    make_cover:
+      needs:
+        - eunit_and_proper
+        - ct
+        - ct_docker
+      runs-on: ubuntu-20.04
+      container: "ghcr.io/emqx/emqx-builder/5.0-17:1.13.4-24.2.1-1-ubuntu20.04"
+      steps:
+      - uses: AutoModality/action-clean@v1
+      - uses: actions/download-artifact@v2
+        with:
+          name: source
+          path: .
+      - name: unzip source code
+        run: unzip -q source.zip
+
+      - uses: actions/download-artifact@v2
+        name: download coverdata
+        with:
+          name: coverdata
+          path: source/_build/test/cover
+
+      - name: make cover
+        working-directory: source
+        run: make cover
+
+      - name: send to coveralls
+        working-directory: source
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: make coveralls
+
+      - name: get coveralls logs
+        working-directory: source
+        if: failure()
+        run: cat rebar3.crashdump
+
+    # do this in a separate job
+    upload_coverdata:
+      needs: make_cover
+      runs-on: ubuntu-20.04
+      steps:
+        - name: Coveralls Finished
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          run: |
+            curl -v -k https://coveralls.io/webhook \
+                 --header "Content-Type: application/json" \
+                 --data "{\"repo_name\":\"$GITHUB_REPOSITORY\",\"repo_token\":\"$GITHUB_TOKEN\",\"payload\":{\"build_num\":$GITHUB_RUN_ID,\"status\":\"done\"}}" || true
+
+    allgood_functional_tests:
+      runs-on: ubuntu-20.04
+      needs:
+        - eunit_and_proper
+        - ct_docker
+        - ct
+      steps:
+      - name: Check if all functional tests succeeded
+        uses: re-actors/alls-green@release/v1
+        with:
+          #allowed-failures:
+          #allowed-skips:
+          jobs: ${{ toJSON(needs) }}

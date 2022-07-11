@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+
+# This script helps to build release artifacts.
+# arg1: profile, e.g. emqx | emqx-pkg
+# arg2: artifact, e.g. rel | relup | tgz | pkg
+
+if [[ -n "$DEBUG" ]]; then
+    set -x
+fi
+set -euo pipefail
+
+DEBUG="${DEBUG:-0}"
+if [ "$DEBUG" -eq 1 ]; then
+    set -x
+fi
+
+PROFILE="$1"
+ARTIFACT="$2"
+
+# ensure dir
+cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")"
+
+PKG_VSN="${PKG_VSN:-$(./pkg-vsn.sh "$PROFILE")}"
+export PKG_VSN
+
+SYSTEM="$(./scripts/get-distro.sh)"
+
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64)
+        ARCH='amd64'
+        ;;
+    aarch64)
+        ARCH='arm64'
+        ;;
+    arm*)
+        ARCH='arm64'
+        ;;
+esac
+export ARCH
+
+##
+## Support RPM and Debian based linux systems
+##
+if [ "$(uname -s)" = 'Linux' ]; then
+    case "${SYSTEM:-}" in
+        ubuntu*|debian*|raspbian*)
+            PKGERDIR='deb'
+            ;;
+        *)
+            PKGERDIR='rpm'
+            ;;
+    esac
+fi
+
+if [ "${SYSTEM}" = 'windows' ]; then
+    # windows does not like the find
+    FIND="/usr/bin/find"
+    TAR="/usr/bin/tar"
+else
+    FIND='find'
+    TAR='tar'
+fi
+
+log() {
+    local msg="$1"
+    # rebar3 prints ===>, so we print ===<
+    echo "===< $msg"
+}
+
+make_docs() {
+    local libs_dir1 libs_dir2 libs_dir3
+    libs_dir1="$("$FIND" "_build/$PROFILE/lib/" -maxdepth 2 -name ebin -type d)"
+    if [ -d "_build/default/lib/" ]; then
+        libs_dir2="$("$FIND" "_build/default/lib/" -maxdepth 2 -name ebin -type d)"
+    else
+        libs_dir2=''
+    fi
+    if [ -d "_build/$PROFILE/checkouts" ]; then
+        libs_dir3="$("$FIND" "_build/$PROFILE/checkouts/" -maxdepth 2 -name ebin -type d 2>/dev/null || true)"
+    else
+        libs_dir3=''
+    fi
+    case $PROFILE in
+        emqx-enterprise)
+            SCHEMA_MODULE='emqx_enterprise_conf_schema'
+            ;;
+        *)
+            SCHEMA_MODULE='emqx_conf_schema'
+            ;;
+    esac
+    # shellcheck disable=SC2086
+    erl -noshell -pa $libs_dir1 $libs_dir2 $libs_dir3 -eval \
+        "Dir = filename:join([apps, emqx_dashboard, priv, www, static]), \
+         I18nFile = filename:join([apps, emqx_dashboard, priv, 'i18n.conf']), \
+         ok = emqx_conf:dump_schema(Dir, $SCHEMA_MODULE, I18nFile), \
+         halt(0)."
+}
+
+assert_no_compile_time_only_deps() {
+    if [ "$("$FIND" "_build/$PROFILE/rel/emqx/lib/" -maxdepth 1 -name 'gpb-*' -type d)" != "" ]; then
+        echo "gpb should not be included in the release"
+        exit 1
+    fi
+}
+
+make_rel() {
+    # compile all beams
+    ./rebar3 as "$PROFILE" compile
+    # generate docs (require beam compiled), generated to etc and priv dirs
+    make_docs
+    # now assemble the release tar
+    ./rebar3 as "$PROFILE" tar
+    assert_no_compile_time_only_deps
+}
+
+make_elixir_rel() {
+  export_release_vars "$PROFILE"
+  mix release --overwrite
+  assert_no_compile_time_only_deps
+}
+
+## extract previous version .tar.gz files to _build/$PROFILE/rel/emqx before making relup
+make_relup() {
+    local rel_dir="_build/$PROFILE/rel/emqx"
+    local name_pattern
+    name_pattern="${PROFILE}-$(./pkg-vsn.sh "$PROFILE" --vsn_matcher --long)"
+    local releases=()
+    while read -r tgzfile ; do
+        local base_vsn
+        base_vsn="$(echo "$tgzfile" | grep -oE "[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9])?(-[0-9a-f]{8})?" | head -1)"
+        ## we have to create tmp dir to untar old tgz, as `tar --skip-old-files` is not supported on all plantforms
+        local tmp_dir
+        tmp_dir="$(mktemp -d -t emqx.XXXXXXX)"
+        $TAR -C "$tmp_dir" -zxf "$tgzfile"
+        mkdir -p "${rel_dir}/releases/"
+        cp -npr "$tmp_dir/releases"/* "${rel_dir}/releases/"
+        ## There is for some reason a copy of the '$PROFILE.rel' file to releases dir,
+        ## the content is duplicated to releases/5.0.0/$PROFILE.rel.
+        ## This file seems to be useless, but yet confusing as it does not change after upgrade/downgrade
+        ## Hence we force delete this file.
+        rm -f "${rel_dir}/releases/${PROFILE}.rel"
+        mkdir -p "${rel_dir}/lib/"
+        cp -npr "$tmp_dir/lib"/* "${rel_dir}/lib/"
+        rm -rf "$tmp_dir"
+        releases+=( "$base_vsn" )
+    done < <("$FIND" _upgrade_base -maxdepth 1 -name "${name_pattern}.tar.gz" -type f)
+    if [ ${#releases[@]} -eq 0 ]; then
+        log "No upgrade base found, relup ignored"
+        return 0
+    fi
+    RELX_BASE_VERSIONS="$(IFS=, ; echo "${releases[*]}")"
+    export RELX_BASE_VERSIONS
+    ./rebar3 as "$PROFILE" relup --relname emqx --relvsn "${PKG_VSN}"
+}
+
+cp_dyn_libs() {
+    local rel_dir="$1"
+    local target_dir="${rel_dir}/dynlibs"
+    if ! [ "$(uname -s)" = 'Linux' ]; then
+        return 0;
+    fi
+    mkdir -p "$target_dir"
+    while read -r so_file; do
+        cp -L "$so_file" "$target_dir/"
+    done < <("$FIND" "$rel_dir" -type f \( -name "*.so*" -o -name "beam.smp" \) -print0 \
+        | xargs -0 ldd \
+        | grep -E '(libcrypto)|(libtinfo)|(libatomic)' \
+        | awk '{print $3}' \
+        | sort -u)
+}
+
+## Re-pack the relx assembled .tar.gz to EMQX's package naming scheme
+## It assumes the .tar.gz has been built -- relies on Makefile dependency
+make_tgz() {
+    local pkgpath="_packages/${PROFILE}"
+    local src_tarball
+    local target_name
+    local target
+
+    if [ "${IS_ELIXIR:-no}" = "yes" ]
+    then
+      # ensure src_tarball exists
+      ELIXIR_MAKE_TAR=yes make_elixir_rel
+
+      local relpath="_build/${PROFILE}"
+      full_vsn="$(./pkg-vsn.sh "$PROFILE" --long --elixir)"
+    else
+      # build the src_tarball again to ensure relup is included
+      # elixir does not have relup yet.
+      make_rel
+
+      local relpath="_build/${PROFILE}/rel/emqx"
+      full_vsn="$(./pkg-vsn.sh "$PROFILE" --long)"
+    fi
+    target_name="${PROFILE}-${full_vsn}.tar.gz"
+    target="${pkgpath}/${target_name}"
+
+    src_tarball="${relpath}/emqx-${PKG_VSN}.tar.gz"
+    tard="$(mktemp -d -t emqx.XXXXXXX)"
+    mkdir -p "${tard}/emqx"
+    mkdir -p "${pkgpath}"
+    if [ ! -f "$src_tarball" ]; then
+        log "ERROR: $src_tarball is not found"
+    fi
+    $TAR zxf "${src_tarball}" -C "${tard}/emqx"
+    if [ -f "${tard}/emqx/releases/${PKG_VSN}/relup" ]; then
+        ./scripts/relup-build/inject-relup.escript "${tard}/emqx/releases/${PKG_VSN}/relup"
+    fi
+    ## try to be portable for tar.gz packages.
+    ## for DEB and RPM packages the dependencies are resoved by yum and apt
+    cp_dyn_libs "${tard}/emqx"
+    ## create tar after change dir
+    ## to avoid creating an extra level of 'emqx' dir in the .tar.gz file
+    pushd "${tard}/emqx" >/dev/null
+    $TAR -zcf "../${target_name}" -- *
+    popd >/dev/null
+    mv "${tard}/${target_name}" "${target}"
+    case "$SYSTEM" in
+        macos*)
+            # sha256sum may not be available on macos
+            openssl dgst -sha256 "${target}" | cut -d ' ' -f 2  > "${target}.sha256"
+            ;;
+        *)
+            sha256sum "${target}" | head -c 64 > "${target}.sha256"
+            ;;
+    esac
+    log "Tarball successfully repacked: ${target}"
+    log "Tarball sha256sum: $(cat "${target}.sha256")"
+}
+
+## This function builds the default docker image based on debian 11
+make_docker() {
+    EMQX_BUILDER="${EMQX_BUILDER:-${EMQX_DEFAULT_BUILDER}}"
+    EMQX_RUNNER="${EMQX_RUNNER:-${EMQX_DEFAULT_RUNNER}}"
+    if [ -z "${EMQX_DOCKERFILE:-}" ]; then
+        if [[ "$EMQX_BUILDER" =~ "alpine" ]]; then
+            EMQX_DOCKERFILE='deploy/docker/Dockerfile.alpine'
+        else
+            EMQX_DOCKERFILE='deploy/docker/Dockerfile'
+        fi
+    fi
+    if [[ "$PROFILE" = *-elixir ]]; then
+      PKG_VSN="$PKG_VSN-elixir"
+    fi
+
+    set -x
+    docker build --no-cache --pull \
+       --build-arg BUILD_FROM="${EMQX_BUILDER}" \
+       --build-arg RUN_FROM="${EMQX_RUNNER}" \
+       --build-arg EMQX_NAME="$PROFILE" \
+       --tag "emqx/${PROFILE%%-elixir}:${PKG_VSN}" \
+       -f "${EMQX_DOCKERFILE}" .
+}
+
+function join {
+  local IFS="$1"
+  shift
+  echo "$*"
+}
+
+# used to control the Elixir Mix Release output
+# see docstring in `mix.exs`
+export_release_vars() {
+  local profile="$1"
+  case "$profile" in
+    emqx|emqx-enterprise)
+      export ELIXIR_MAKE_TAR=${ELIXIR_MAKE_TAR:-no}
+      ;;
+    emqx-pkg|emqx-enterprise-pkg)
+      export ELIXIR_MAKE_TAR=${ELIXIR_MAKE_TAR:-yes}
+      ;;
+    *)
+      echo Invalid profile "$profile"
+      exit 1
+  esac
+  export MIX_ENV="$profile"
+
+  local erl_opts=()
+
+  case "$profile" in
+    *enterprise*)
+      erl_opts+=( "{d, 'EMQX_RELEASE_EDITION', ee}" )
+      ;;
+    *)
+      erl_opts+=( "{d, 'EMQX_RELEASE_EDITION', ce}" )
+      ;;
+  esac
+
+  # At this time, Mix provides no easy way to pass `erl_opts' to
+  # dependencies.  The workaround is to set this variable before
+  # compiling the project, so that `emqx_release.erl' picks up
+  # `emqx_vsn' as if it was compiled by rebar3.
+  erl_opts+=( "{compile_info,[{emqx_vsn,\"${PKG_VSN}\"}]}" )
+
+  ERL_COMPILER_OPTIONS="[$(join , "${erl_opts[@]}")]"
+  export ERL_COMPILER_OPTIONS
+}
+
+log "building artifact=$ARTIFACT for profile=$PROFILE"
+
+case "$ARTIFACT" in
+    doc|docs)
+        make_docs
+        ;;
+    rel)
+        make_rel
+        ;;
+    relup)
+        make_relup
+        ;;
+    tgz)
+        make_tgz
+        ;;
+    pkg)
+        # this only affect build artifacts, such as schema doc
+        export EMQX_ETC_DIR='/etc/emqx/'
+        if [ -z "${PKGERDIR:-}" ]; then
+            log "Skipped making deb/rpm package for $SYSTEM"
+            exit 0
+        fi
+        export EMQX_REL_FORM="$PKGERDIR"
+        if [ "${IS_ELIXIR:-}" = 'yes' ]; then
+            make_elixir_rel
+        else
+            make_rel
+        fi
+        env EMQX_REL="$(pwd)" \
+            EMQX_BUILD="${PROFILE}" \
+            make -C "deploy/packages/${PKGERDIR}" clean
+        env EMQX_REL="$(pwd)" \
+            EMQX_BUILD="${PROFILE}" \
+            make -C "deploy/packages/${PKGERDIR}"
+        ;;
+    docker)
+        make_docker
+        ;;
+    elixir)
+        make_elixir_rel
+        ;;
+    *)
+        log "Unknown artifact $ARTIFACT"
+        exit 1
+        ;;
+esac
