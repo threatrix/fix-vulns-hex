@@ -1,0 +1,16 @@
+<article>
+   {if tags} 
+      {for tag in tags}
+         {if @head.tag}
+         <ul id="tags">
+         {/if}
+         <li>{tag}</li>
+         {if @tail.tag}
+         </ul>
+         {/if}
+      {/for}
+  {else}
+    <p>No tags!</p>
+  {/if}
+  <div>{content}</div>
+</article>

@@ -1,0 +1,13 @@
+{application, swirl,
+   [
+      {description, "swirl template compiler"},
+      {vsn,         "0.5.3"},
+      {modules,     []},
+      {registered,  []},
+      {applications,[
+         kernel,
+         stdlib
+      ]},
+      {env, []}
+   ]
+}.  

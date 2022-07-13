@@ -1,0 +1,8 @@
+[{<<"feta">>,
+  {git,"https://github.com/fogfish/feta",
+       {ref,"c5d251b3f995b96afd5e8ec7da61516842aa658c"}},
+  0},
+ {<<"jsx">>,
+  {git,"https://github.com/talentdeficit/jsx",
+       {ref,"1d3407aa9752430ec0a06111ac1b046ffafdca22"}},
+  0}].
